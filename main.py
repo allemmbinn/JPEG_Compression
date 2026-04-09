@@ -5,6 +5,7 @@ import matplotlib.pyplot as plt
 from scipy.fftpack import dct
 import pickle
 from skimage import data
+from decoder import jpeg_decode
 
 """
 Standard JPEG Luminance Quantization Matrix
@@ -33,6 +34,17 @@ QUANT_MATRIX_C = np.array([
     [99, 99, 99, 99, 99, 99, 99, 99],
     [99, 99, 99, 99, 99, 99, 99, 99]
 ])
+
+"""
+Function : Scale a base quantization matrix to a given quality level
+Input    : base_matrix (8x8), quality (1–100; higher = better quality / less compression)
+Output   : Scaled quantization matrix (8x8, int32), values clamped to [1, 255]
+"""
+def scale_quant_matrix(base_matrix, quality):
+    quality = max(1, min(100, quality))
+    scale   = 5000 / quality if quality < 50 else 200 - 2 * quality
+    scaled  = np.floor((base_matrix * scale + 50) / 100).astype(np.int32)
+    return np.clip(scaled, 1, 255)
 
 # Standard zigzag scan order for an 8x8 block (row, col) pairs
 ZIGZAG_ORDER = [
@@ -155,9 +167,10 @@ def estimate_channel_size(compressed_channel):
 Function : JPEG Encoder - Full compression pipeline
 Input    : image_path  - path to input image file
            output_path - path to save compressed data (.pkl)
+           quality     - compression quality level (1–100; higher = better quality)
 Output   : Compression ratio (float), saves compressed .pkl file
 """
-def jpeg_encode(image_path, output_path='compressed.pkl'):
+def jpeg_encode(image_path, output_path='compressed.pkl', quality=75):
     image = plt.imread(image_path)
     if image.max() <= 1.0:
         image = (image * 255).astype(np.uint8)
@@ -172,15 +185,19 @@ def jpeg_encode(image_path, output_path='compressed.pkl'):
     original_height, original_width = image.shape[:2]
     original_size = original_height * original_width * 3  # bytes for raw RGB
 
+    qmat_Y = scale_quant_matrix(QUANT_MATRIX_Y, quality)
+    qmat_C = scale_quant_matrix(QUANT_MATRIX_C, quality)
+
     print(f"[Encoder] Image       : {image_path}")
+    print(f"[Encoder] Quality     : {quality}")
     print(f"[Encoder] Dimensions  : {original_height} x {original_width}")
     print(f"[Encoder] Original    : {original_size / 1024:.2f} KB")
 
     ycbcr_image             = rgb_to_ycbcr(image)
     Y, Cb, Cr               = subsample(ycbcr_image)
-    comp_Y,  h_Y,  w_Y      = process_channel_for_compression(Y,  QUANT_MATRIX_Y)
-    comp_Cb, h_Cb, w_Cb     = process_channel_for_compression(Cb, QUANT_MATRIX_C)
-    comp_Cr, h_Cr, w_Cr     = process_channel_for_compression(Cr, QUANT_MATRIX_C)
+    comp_Y,  h_Y,  w_Y      = process_channel_for_compression(Y,  qmat_Y)
+    comp_Cb, h_Cb, w_Cb     = process_channel_for_compression(Cb, qmat_C)
+    comp_Cr, h_Cr, w_Cr     = process_channel_for_compression(Cr, qmat_C)
 
     compressed_size = (estimate_channel_size(comp_Y) +
                        estimate_channel_size(comp_Cb) +
@@ -195,8 +212,8 @@ def jpeg_encode(image_path, output_path='compressed.pkl'):
         'Y'  : comp_Y,  'h_Y'  : h_Y,  'w_Y'  : w_Y,
         'Cb' : comp_Cb, 'h_Cb' : h_Cb, 'w_Cb' : w_Cb,
         'Cr' : comp_Cr, 'h_Cr' : h_Cr, 'w_Cr' : w_Cr,
-        'quant_matrix_Y' : QUANT_MATRIX_Y,
-        'quant_matrix_C' : QUANT_MATRIX_C,
+        'quant_matrix_Y' : qmat_Y,
+        'quant_matrix_C' : qmat_C,
         'original_height': original_height,
         'original_width' : original_width,
     }
@@ -209,6 +226,37 @@ def jpeg_encode(image_path, output_path='compressed.pkl'):
 
 # ---------------------------------------------------------------------------
 if __name__ == '__main__':
-    image = data.camera()  # Load sample image from skimage
-    plt.imsave('cameraman.png', image)
-    jpeg_encode('cameraman.png', 'cameraman_compressed.pkl')
+    image = data.astronaut()  # Load sample color image from skimage (RGB)
+    plt.imsave('astronaut.png', image)
+
+    QUALITY_LEVELS = [
+        ('Low',    25),
+        ('Medium', 50),
+        ('High',   75),
+    ]
+
+    results = []  # (label, quality, ratio, reconstructed_image)
+    for label, quality in QUALITY_LEVELS:
+        pkl_path = f'astronaut_q{quality}.pkl'
+        ratio    = jpeg_encode('astronaut.png', pkl_path, quality=quality)
+        recon    = jpeg_decode(pkl_path)
+        results.append((label, quality, ratio, recon))
+        print()
+
+    # --- 4-panel comparison: Original | Low | Medium | High ---
+    fig, axes = plt.subplots(1, 4, figsize=(20, 5))
+
+    axes[0].imshow(image)
+    axes[0].set_title("Original", fontsize=13)
+    axes[0].axis('off')
+
+    for ax, (label, quality, ratio, recon) in zip(axes[1:], results):
+        ax.imshow(recon)
+        ax.set_title(f"{label} (Q={quality})\nRatio {ratio:.2f}:1", fontsize=13)
+        ax.axis('off')
+
+    plt.suptitle("JPEG Quality Level Comparison", fontsize=15, y=1.02)
+    plt.tight_layout()
+    plt.savefig('astronaut_quality_comparison.png', dpi=150, bbox_inches='tight')
+    plt.close()
+    print("[Main] Quality comparison saved to : astronaut_quality_comparison.png")
