@@ -1,155 +1,214 @@
 import numpy as np
+import matplotlib
+matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from scipy.fftpack import dct, idct
-import itertools
+from scipy.fftpack import dct
+import pickle
+from skimage import data
+
+"""
+Standard JPEG Luminance Quantization Matrix
+"""
+QUANT_MATRIX_Y = np.array([
+    [16, 11, 10, 16,  24,  40,  51,  61],
+    [12, 12, 14, 19,  26,  58,  60,  55],
+    [14, 13, 16, 24,  40,  57,  69,  56],
+    [14, 17, 22, 29,  51,  87,  80,  62],
+    [18, 22, 37, 56,  68, 109, 103,  77],
+    [24, 35, 55, 64,  81, 104, 113,  92],
+    [49, 64, 78, 87, 103, 121, 120, 101],
+    [72, 92, 95, 98, 112, 100, 103,  99]
+])
+
+"""
+Standard JPEG Chrominance Quantization Matrix
+"""
+QUANT_MATRIX_C = np.array([
+    [17, 18, 24, 47, 99, 99, 99, 99],
+    [18, 21, 26, 66, 99, 99, 99, 99],
+    [24, 26, 56, 99, 99, 99, 99, 99],
+    [47, 66, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99],
+    [99, 99, 99, 99, 99, 99, 99, 99]
+])
+
+# Standard zigzag scan order for an 8x8 block (row, col) pairs
+ZIGZAG_ORDER = [
+    (0,0),(0,1),(1,0),(2,0),(1,1),(0,2),(0,3),(1,2),
+    (2,1),(3,0),(4,0),(3,1),(2,2),(1,3),(0,4),(0,5),
+    (1,4),(2,3),(3,2),(4,1),(5,0),(6,0),(5,1),(4,2),
+    (3,3),(2,4),(1,5),(0,6),(0,7),(1,6),(2,5),(3,4),
+    (4,3),(5,2),(6,1),(7,0),(7,1),(6,2),(5,3),(4,4),
+    (3,5),(2,6),(1,7),(2,7),(3,6),(4,5),(5,4),(6,3),
+    (7,2),(7,3),(6,4),(5,5),(4,6),(3,7),(4,7),(5,6),
+    (6,5),(7,4),(7,5),(6,6),(5,7),(6,7),(7,6),(7,7)
+]
 
 """
 Function : Convert RGB Image to YCbCr Image
-Input    : RGB Image
-Output   : YCbCr Image
+Input    : RGB Image (H x W x 3, uint8)
+Output   : YCbCr Image (H x W x 3, float32)
 """
 def rgb_to_ycbcr(image):
-    ycbcr_image = np.zeros(image.shape)
-    # Transformation Matrix
+    # Transformation Matrix (RGB -> YCbCr)
     T = np.array([
-                [ 0.299, 0.587, 0.114],
-                [-0.169,-0.331,-0.500],
-                [ 0.500,-0.419,-0.081]])
-    # Conversion
-    for i in range(image.shape[0]):
-        for j in range(image.shape[1]):
-            rgb_pixel = image[i, j, :]
-            ycbcr_image[i, j, :] = T@rgb_pixel + np.array([0, 128, 128])
+        [ 0.299,  0.587,  0.114],
+        [-0.169, -0.331,  0.500],   # +0.500 for B (standard JPEG YCbCr)
+        [ 0.500, -0.419, -0.081]
+    ])
+    img_float   = image.astype(np.float32)
+    ycbcr_image = img_float @ T.T + np.array([0, 128, 128], dtype=np.float32)
     return ycbcr_image
 
 """
-Function : Convert YCbCr Image to RGB Image
-Input    : YCbCr Image
-Output   : RGB Image
+Function : Sub-sample the Cb and Cr channels using 4:2:0 scheme
+Input    : YCbCr Image (H x W x 3, float32)
+Output   : Y, Cb, Cr channels (Cb and Cr at half resolution)
 """
-def ycbcr_to_rgb(image):
-    rgb_image = np.zeros(image.shape)
-    # Transformation Matrix
-    T = np.array([
-                [1.0, 0.000, 1.402],
-                [1.0,-0.344,-0.714],
-                [1.0, 1.772, 0.000]])
-    # Conversion
-    for i in range(image.shape):
-        for j in range(image.shape):
-            ycbcr_to_rgb = image[i, j, :]
-            rgb_image[i, j, :] = T@(ycbcr_to_rgb - np.array([0, 128, 128]))
-    return rgb_image
-    
-"""
-Function : Subsample Cb and Cr
-TODO : Look into this function
-"""
-# Sub-sampling (4:2:0) 
 def subsample(ycbcr_image):
-    Y, Cb, Cr = ycbcr_image[:,:,0], ycbcr_image[:,:,1], ycbcr_image[:,:,2]
-    Cb = Cb[::2, ::2]
-    Cr = Cr[::2, ::2]
+    Y  = ycbcr_image[:, :, 0]
+    Cb = ycbcr_image[:, :, 1][::2, ::2]
+    Cr = ycbcr_image[:, :, 2][::2, ::2]
     return Y, Cb, Cr
 
-# TODO : Change this
-def upsample(Y, Cb, Cr):
-    Cb_up = np.repeat(np.repeat(Cb, 2, axis=0), 2, axis=1)
-    Cr_up = np.repeat(np.repeat(Cr, 2, axis=0), 2, axis=1)
-    return np.dstack((Y, Cb_up, Cr_up))
-
-# Discrete Cosine Transform (DCT) and Inverse DCT
+"""
+Function : Apply 2D DCT to an 8x8 block
+Input    : 8x8 numpy array (float)
+Output   : DCT coefficient block (8x8)
+"""
 def apply_dct(block):
     return dct(dct(block.T, norm='ortho').T, norm='ortho')
 
 """
-Function : DCT Transform on Spatial Image
-Input    : YCbCr Image
-Output   : RGB Image
+Function : Quantize DCT block using the standard quantization matrix
+Input    : DCT block (8x8), quantization matrix (8x8)
+Output   : Quantized integer block (8x8, int32)
 """
-def dct_transform(block):
-    bl_shape = block.shape
-    for i in range(bl_shape[0]):
-        for j in range(bl_shape[1]):
-            
-def apply_idct(block):
-    return idct(idct(block.T, norm='ortho').T, norm='ortho')
-
-# Quantization and Inverse Quantization
 def quantize(block, quant_matrix):
     return np.round(block / quant_matrix).astype(np.int32)
 
-def dequantize(block, quant_matrix):
-    return (block * quant_matrix).astype(np.float32)
+"""
+Function : Scan an 8x8 quantized block in zigzag order
+Input    : Quantized 8x8 block
+Output   : List of 64 integers in zigzag order
+"""
+def zigzag_scan(block):
+    return [int(block[r, c]) for r, c in ZIGZAG_ORDER]
 
-# Processing for Compression and Decompression
+"""
+Function : Run-Length Encode the AC coefficients of a zigzag-scanned block
+Input    : 64-element coefficient list (index 0 is the DC coefficient)
+Output   : DC coefficient (int), RLE list of (zero_run, value) tuples
+"""
+def rle_encode(coefficients):
+    dc_coeff  = coefficients[0]
+    ac_coeffs = coefficients[1:]
+    encoded   = []
+    zero_run  = 0
+    for val in ac_coeffs:
+        if val == 0:
+            zero_run += 1
+        else:
+            encoded.append((zero_run, val))
+            zero_run = 0
+    encoded.append((0, 0))  # End-of-Block (EOB) marker
+    return dc_coeff, encoded
+
+"""
+Function : Compress a single image channel using DCT + Quantization + RLE
+Input    : Channel array (H x W, float32), quantization matrix (8x8)
+Output   : Compressed block list, padded height, padded width
+"""
 def process_channel_for_compression(channel, quant_matrix):
     height, width = channel.shape
     padded_height = (height + 7) // 8 * 8
-    padded_width = (width + 7) // 8 * 8
-    padded_channel = np.pad(channel, ((0, padded_height - height), (0, padded_width - width)), mode='constant', constant_values=0)
-    
+    padded_width  = (width  + 7) // 8 * 8
+    padded_channel = np.pad(channel,
+                            ((0, padded_height - height), (0, padded_width - width)),
+                            mode='constant', constant_values=128)
     compressed_channel = []
     for i in range(0, padded_height, 8):
         for j in range(0, padded_width, 8):
-            block = padded_channel[i:i+8, j:j+8] - 128  # Level shift
-            dct_block = apply_dct(block)
-            quantized_block = quantize(dct_block, quant_matrix)
-            compressed_channel.append(quantized_block)
+            block       = padded_channel[i:i+8, j:j+8] - 128  # Level shift
+            dct_block   = apply_dct(block)
+            quant_block = quantize(dct_block, quant_matrix)
+            zigzag      = zigzag_scan(quant_block)
+            dc, rle     = rle_encode(zigzag)
+            compressed_channel.append((dc, rle))
     return compressed_channel, padded_height, padded_width
 
-def process_channel_for_decompression(compressed_channel, padded_height, padded_width, quant_matrix):
-    decompressed_channel = np.zeros((padded_height, padded_width), dtype=np.float32)
-    idx = 0
-    for i in range(0, padded_height, 8):
-        for j in range(0, padded_width, 8):
-            quantized_block = compressed_channel[idx]
-            dequantized_block = dequantize(quantized_block, quant_matrix)
-            idct_block = apply_idct(dequantized_block) + 128  # Level shift back
-            decompressed_channel[i:i+8, j:j+8] = idct_block
-            idx += 1
-    return np.clip(decompressed_channel[:padded_height, :padded_width], 0, 255).astype(np.uint8)
+"""
+Function : Estimate the byte size of a compressed channel
+Input    : Compressed channel list of (dc, rle) tuples
+Output   : Estimated byte count (assuming int16 encoding)
+"""
+def estimate_channel_size(compressed_channel):
+    total = 0
+    for dc_coeff, rle in compressed_channel:
+        total += 2              # DC coefficient stored as int16 (2 bytes)
+        total += len(rle) * 4  # Each (zero_run, value) pair = 2 x int16
+    return total
 
-# JPEG Compression and Decompression Pipeline
-def jpeg_compress_decompress(image_path):
+"""
+Function : JPEG Encoder - Full compression pipeline
+Input    : image_path  - path to input image file
+           output_path - path to save compressed data (.pkl)
+Output   : Compression ratio (float), saves compressed .pkl file
+"""
+def jpeg_encode(image_path, output_path='compressed.pkl'):
     image = plt.imread(image_path)
-    if image.max() <= 1:
+    if image.max() <= 1.0:
         image = (image * 255).astype(np.uint8)
-    plt.imshow(image)
-    plt.title("Original Image")
-    plt.axis('off')
-    plt.show()
-    
-    ycbcr_image = rgb_to_ycbcr(image)
-    Y, Cb, Cr = subsample(ycbcr_image)
+    else:
+        image = image.astype(np.uint8)
 
-    global quant_matrix
-    quant_matrix = np.array([[16, 11, 10, 16, 24, 40, 51, 61],
-                             [12, 12, 14, 19, 26, 58, 60, 55],
-                             [14, 13, 16, 24, 40, 57, 69, 56],
-                             [14, 17, 22, 29, 51, 87, 80, 62],
-                             [18, 22, 37, 56, 68, 109, 103, 77],
-                             [24, 35, 55, 64, 81, 104, 113, 92],
-                             [49, 64, 78, 87, 103, 121, 120, 101],
-                             [72, 92, 95, 98, 112, 100, 103, 99]])
+    # Normalise to H x W x 3 (handle grayscale and RGBA inputs)
+    if len(image.shape) == 2:
+        image = np.stack([image, image, image], axis=2)
+    image = image[:, :, :3]
 
-    compressed_Y, h_Y, w_Y = process_channel_for_compression(Y, quant_matrix)
-    compressed_Cb, h_Cb, w_Cb = process_channel_for_compression(Cb, quant_matrix)
-    compressed_Cr, h_Cr, w_Cr = process_channel_for_compression(Cr, quant_matrix)
+    original_height, original_width = image.shape[:2]
+    original_size = original_height * original_width * 3  # bytes for raw RGB
 
-    decompressed_Y = process_channel_for_decompression(compressed_Y, h_Y, w_Y, quant_matrix)
-    decompressed_Cb = process_channel_for_decompression(compressed_Cb, h_Cb, w_Cb, quant_matrix)
-    decompressed_Cr = process_channel_for_decompression(compressed_Cr, h_Cr, w_Cr, quant_matrix)
+    print(f"[Encoder] Image       : {image_path}")
+    print(f"[Encoder] Dimensions  : {original_height} x {original_width}")
+    print(f"[Encoder] Original    : {original_size / 1024:.2f} KB")
 
-    decompressed_ycbcr = upsample(decompressed_Y, decompressed_Cb, decompressed_Cr)
-    decompressed_image = ycbcr_to_rgb(decompressed_ycbcr)
+    ycbcr_image             = rgb_to_ycbcr(image)
+    Y, Cb, Cr               = subsample(ycbcr_image)
+    comp_Y,  h_Y,  w_Y      = process_channel_for_compression(Y,  QUANT_MATRIX_Y)
+    comp_Cb, h_Cb, w_Cb     = process_channel_for_compression(Cb, QUANT_MATRIX_C)
+    comp_Cr, h_Cr, w_Cr     = process_channel_for_compression(Cr, QUANT_MATRIX_C)
 
-    plt.imshow(decompressed_image)
-    plt.title("Decompressed Image")
-    plt.axis('off')
-    plt.show()
+    compressed_size = (estimate_channel_size(comp_Y) +
+                       estimate_channel_size(comp_Cb) +
+                       estimate_channel_size(comp_Cr))
+    ratio = original_size / compressed_size
 
-    return decompressed_image
+    print(f"[Encoder] Compressed  : {compressed_size / 1024:.2f} KB")
+    print(f"[Encoder] Ratio       : {ratio:.2f}:1")
 
-# Example usage
-jpeg_compress_decompress('/home/allemmbinn/Documents/JPEG_Compression/color_image.jpg')
+    # Bundle only what the decoder needs — do NOT store the raw image
+    compressed_data = {
+        'Y'  : comp_Y,  'h_Y'  : h_Y,  'w_Y'  : w_Y,
+        'Cb' : comp_Cb, 'h_Cb' : h_Cb, 'w_Cb' : w_Cb,
+        'Cr' : comp_Cr, 'h_Cr' : h_Cr, 'w_Cr' : w_Cr,
+        'quant_matrix_Y' : QUANT_MATRIX_Y,
+        'quant_matrix_C' : QUANT_MATRIX_C,
+        'original_height': original_height,
+        'original_width' : original_width,
+    }
+    with open(output_path, 'wb') as f:
+        pickle.dump(compressed_data, f)
+    print(f"[Encoder] Saved to    : {output_path}")
+
+    return ratio
+
+
+# ---------------------------------------------------------------------------
+if __name__ == '__main__':
+    image = data.camera()  # Load sample image from skimage
+    plt.imsave('cameraman.png', image)
+    jpeg_encode('cameraman.png', 'cameraman_compressed.pkl')
